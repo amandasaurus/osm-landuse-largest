@@ -1,24 +1,30 @@
 #!/bin/bash
 set -o errexit -o nounset
 
-if [ "${1:-}" = "-v" ] ; then
-	set -x
-	shift
-fi
+INPUT=planet-latest.osm.pbf
 
-if [ ! -e planet-latest.osm.pbf ] ; then
+while getopts "i:v" OPT ; do
+	case $OPT in
+		v) set -v ;;
+		i) INPUT=$OPTARG ;;
+		*) exit 1 ;;
+	esac
+done
+PREFIX=$(basename "$INPUT")
+PREFIX=${PREFIX%%.osm.pbf}
+PREFIX=${PREFIX%%-latest}
+
+
+if [ ! -e "$INPUT" ] ; then
 	aria2c --seed-time=0 https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf.torrent
 fi
 
-if [ planet-latest.osm.pbf -nt planet-latest-landuse.osm.pbf ] ; then
-	osmium tags-filter --force planet-latest.osm.pbf -o planet-latest-landuse.osm.pbf landuse
+if [ "${INPUT}" -nt "${PREFIX}-landuse.osm.pbf" ] ; then
+	osmium tags-filter --overwrite "${INPUT}" -o "${PREFIX}-landuse.osm.pbf" landuse
 fi
-osm2pgsql -O flex -S ./landuses-import.lua planet-latest-landuse.osm.pbf
-psql -XAt -c "alter table landuse add column geom geography;"
-psql -XAt -c "update landuse set geom = geometry::geography;"
-psql -XAt -c "alter table landuse drop column geometry;"
+osm2pgsql -O flex -S ./osm2pgsql-landuses-import.lua "${PREFIX}-landuse.osm.pbf"
 psql -XAt -c "alter table landuse add column area real;"
-psql -XAt -c "update landuse set area = st_area(geom);"
+psql -XAt -c "update landuse set area = st_area(geom::geography);"
 psql -XAt -c "create index landuse__area on landuse (area);"
 
 # only include landuses whose total is ≥ 1% of the most popular landuse
@@ -40,7 +46,7 @@ cat landuse_area_p99.csv | sed 1d | while IFS=, read -r LANDUSE_VALUE MIN_AREA ;
 	psql -XAt -o "landuse_${LANDUSE_VALUE}_largest0.01.csv" -c "copy (
 	select row_number() over (order by area desc) as rank, lower(osm_type)||osm_id as osm_id, 'https://www.openstreetmap.org/'||case osm_type when 'R' then 'relation' when 'W' then 'way' end||'/'||osm_id as osm_url, area as area_m2, area*1e-06 as area_km2, st_astext(geom) as geometry from landuse where landuse =  '${LANDUSE_VALUE}' order by area desc
 		) to stdout with (format csv, header on);"
-	ogr2ogr -f GeoJSON landuse_${LANDUSE_VALUE}_largest0.01.geojson landuse_${LANDUSE_VALUE}_largest0.01.csv  -oo KEEP_GEOM_COLUMNS=no -oo GEOM_POSSIBLE_NAMES=geometry -oo HEADERS=yes
-	bzip2 landuse_${LANDUSE_VALUE}_largest0.01.csv
-	bzip2 landuse_${LANDUSE_VALUE}_largest0.01.geojson
+	ogr2ogr -f GeoJSON "landuse_${LANDUSE_VALUE}_largest0.01.geojson" "landuse_${LANDUSE_VALUE}_largest0.01.csv"  -oo KEEP_GEOM_COLUMNS=no -oo GEOM_POSSIBLE_NAMES=geometry -oo HEADERS=yes
+	bzip2 -f "landuse_${LANDUSE_VALUE}_largest0.01.csv"
+	bzip2 -f "landuse_${LANDUSE_VALUE}_largest0.01.geojson"
 done
